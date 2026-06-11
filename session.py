@@ -156,19 +156,164 @@ class SessionOTPBot:
             @self.bot.on(events.NewMessage(pattern='/help'))
             async def help_command(event):
                 if event.sender_id == OWNER_ID:
-                    help_text = """
-**📱 Session OTP Bot Commands:**
+                    help_text = (
+                        "**📱 Session OTP Bot Commands:**\n\n"
+                        "`/add <session_string> <phone>` - Add a new session to monitor\n"
+                        "`/list` - List all active sessions\n"
+                        "`/remove <session_id>` - Remove a session\n"
+                        "`/status` - Check bot status\n\n"
+                        "**How to get session string:**\n"
+                        "```python\n"
+                        "from telethon import TelegramClient\n"
+                        "from telethon.sessions import StringSession\n\n"
+                        "client = TelegramClient(StringSession(), API_ID, API_HASH)\n"
+                        "await client.start()\n"
+                        "print(StringSession.save(client.session))\n"
+                        "```"
+                    )
+                    await event.reply(help_text)
+            
+            @self.bot.on(events.NewMessage(pattern='/add'))
+            async def add_session(event):
+                if event.sender_id != OWNER_ID:
+                    return
+                
+                try:
+                    parts = event.raw_text.split(maxsplit=2)
+                    if len(parts) < 3:
+                        await event.reply("❌ Usage: `/add <session_string> <phone_number>`")
+                        return
+                    
+                    session_string = parts[1]
+                    phone_number = parts[2]
+                    
+                    # Save to database
+                    cursor = self.conn.cursor()
+                    cursor.execute(
+                        "INSERT INTO sessions (session_string, phone_number, created_at) VALUES (?, ?, ?)",
+                        (session_string, phone_number, datetime.now().isoformat())
+                    )
+                    self.conn.commit()
+                    session_id = cursor.lastrowid
+                    
+                    # Start monitoring
+                    task = asyncio.create_task(self.monitor_session(session_string, session_id))
+                    self.active_sessions[session_id] = task
+                    
+                    await event.reply(f"✅ **Session added!**\nID: `{session_id}`\nPhone: {phone_number}\nMonitoring started.")
+                    logger.info(f"Session {session_id} added for {phone_number}")
+                    
+                except Exception as e:
+                    logger.error(f"Add session error: {e}")
+                    await event.reply(f"❌ Error: {str(e)[:200]}")
+            
+            @self.bot.on(events.NewMessage(pattern='/list'))
+            async def list_sessions(event):
+                if event.sender_id != OWNER_ID:
+                    return
+                
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT id, phone_number, created_at, is_active FROM sessions WHERE is_active=1")
+                sessions = cursor.fetchall()
+                
+                if not sessions:
+                    await event.reply("📭 No active sessions found.")
+                    return
+                
+                response = "**📋 Active Sessions:**\n\n"
+                for sid, phone, created, active in sessions:
+                    status = "🟢 Active" if sid in self.active_sessions else "🔴 Stopped"
+                    response += f"**ID:** `{sid}`\n📞 {phone}\n📅 {created[:10]}\n{status}\n\n"
+                
+                await event.reply(response)
+            
+            @self.bot.on(events.NewMessage(pattern='/remove'))
+            async def remove_session(event):
+                if event.sender_id != OWNER_ID:
+                    return
+                
+                try:
+                    parts = event.raw_text.split()
+                    if len(parts) < 2:
+                        await event.reply("❌ Usage: `/remove <session_id>`")
+                        return
+                    
+                    session_id = int(parts[1])
+                    
+                    # Stop monitoring
+                    if session_id in self.active_sessions:
+                        self.active_sessions[session_id].cancel()
+                        del self.active_sessions[session_id]
+                    
+                    # Remove from database
+                    cursor = self.conn.cursor()
+                    cursor.execute("UPDATE sessions SET is_active=0 WHERE id=?", (session_id,))
+                    self.conn.commit()
+                    
+                    await event.reply(f"✅ Session `{session_id}` removed successfully")
+                    logger.info(f"Session {session_id} removed")
+                    
+                except Exception as e:
+                    await event.reply(f"❌ Error: {str(e)}")
+            
+            @self.bot.on(events.NewMessage(pattern='/status'))
+            async def status_command(event):
+                if event.sender_id != OWNER_ID:
+                    return
+                
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM sessions WHERE is_active=1")
+                total = cursor.fetchone()[0]
+                running = len(self.active_sessions)
+                
+                await event.reply(
+                    f"**📊 Bot Status:**\n"
+                    f"• Total sessions: {total}\n"
+                    f"• Active monitors: {running}\n"
+                    f"• Uptime: Online\n"
+                    f"• PID: {os.getpid()}"
+                )
+            
+            # Keep bot running
+            await self.bot.run_until_disconnected()
+            
+        except Exception as e:
+            logger.error(f"Bot error: {e}")
+            raise
+        finally:
+            await self.stop()
+    
+    async def stop(self):
+        """Clean shutdown"""
+        logger.info("Shutting down...")
+        self.is_running = False
+        
+        # Cancel all monitoring tasks
+        for task in self.active_sessions.values():
+            task.cancel()
+        
+        if self.bot:
+            await self.bot.disconnect()
+        
+        if self.conn:
+            self.conn.close()
+        
+        logger.info("Shutdown complete")
 
-`/add <session_string> <phone>` - Add a new session to monitor
-`/list` - List all active sessions
-`/remove <session_id>` - Remove a session
-`/status` - Check bot status
+async def main():
+    """Main entry point"""
+    bot = None
+    try:
+        bot = SessionOTPBot()
+        await bot.run()
+    except KeyboardInterrupt:
+        logger.info("Received shutdown signal")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
+    finally:
+        if bot:
+            await bot.stop()
 
-**How to get session string:**
-```python
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-
-client = TelegramClient(StringSession(), API_ID, API_HASH)
-await client.start()
-print(StringSession.save(client.session))
+if __name__ == "__main__":
+    asyncio.run(main())
